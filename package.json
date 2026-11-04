@@ -1,0 +1,9 @@
+{
+  "name": "multiclaude-tools",
+  "private": true,
+  "description": "asar + fuses CLIs used by the multiclaude engine",
+  "dependencies": {
+    "@electron/asar": "^4.2.0",
+    "@electron/fuses": "^2.1.3"
+  }
+}

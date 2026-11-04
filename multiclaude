@@ -1,0 +1,1166 @@
+#!/usr/bin/python3
+"""multiclaude: run any number of separate Claude desktop instances side by side.
+
+Each instance is its own ~/Applications/Claude <Name>.app with its own bundle id
+(com.anthropic.claudefordesktop.<slug>), its own profile dir
+(~/Library/Application Support/Claude-<Name>), its own icon color and, when the
+blackmode theme is installed, its own UI tint. This generalizes the original
+Personal/Work splitter (claude-launcher-theming/blackmode/stage-*-2x.sh +
+swap-*-2x.sh) to N instances.
+
+Anything that must not happen while an app is running (re-signing, bundle swaps,
+profile edits the app would overwrite) is queued in pending.json and executed by
+a detached runner the moment the relevant instances have quit. Running apps are
+detected with `ps`, never pgrep (macOS pgrep hides the caller's ancestors, so a
+runner spawned from inside Claude Personal would think Personal is closed).
+
+Usage: multiclaude <command> [args]   (multiclaude help)
+"""
+import argparse
+import colorsys
+import datetime as dt
+import hashlib
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import uuid
+
+HOME = os.path.expanduser("~")
+APPS = os.path.join(HOME, "Applications")
+SUPPORT = os.path.join(HOME, "Library", "Application Support")
+MC_DIR = os.path.join(HOME, ".config", "multiclaude")
+REGISTRY = os.path.join(MC_DIR, "instances.json")
+PENDING = os.path.join(MC_DIR, "pending.json")
+STATUS = os.path.join(MC_DIR, "status.json")
+LOG = os.path.join(MC_DIR, "multiclaude.log")
+RUNNER_PID = os.path.join(MC_DIR, "runner.pid")
+CACHE = os.path.join(HOME, "Library", "Caches", "multiclaude")
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+# Optional blackmode theme (Kris's pure-black CSS hook). Everything theme-related
+# is skipped cleanly when these are absent, so the tool also works stock.
+CLAUDE_CFG = os.path.join(HOME, ".config", "Claude")
+BM = os.path.join(CLAUDE_CFG, "blackmode")
+HOOK = os.path.join(BM, "inject-hook.js")
+THEME_CONF = os.path.join(BM, "theme.conf")
+BM_STATE = os.path.join(BM, "state")
+ICON_RECIPE = "icon-v1"  # must match apply-blackmode.sh so it doesn't redo our icons
+
+STOCK_APP = "/Applications/Claude.app"
+BASE_ID = "com.anthropic.claudefordesktop"
+DEFAULT_GLYPH = "#FEFCFB"
+ARCH = "arm64" if os.uname().machine == "arm64" else "x64"
+FEED = f"https://api.anthropic.com/api/desktop/darwin/{ARCH}/squirrel/update"
+UNPACK_GLOB = "{**/*.node,**/*.dylib,**/spawn-helper}"
+PB = "/usr/libexec/PlistBuddy"
+LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+              "LaunchServices.framework/Support/lsregister")
+
+
+# ---------------------------------------------------------------- utilities --
+def log(msg):
+    os.makedirs(MC_DIR, exist_ok=True)
+    line = f"{dt.datetime.now().isoformat(timespec='seconds')} [{os.getpid()}] {msg}"
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+    print(msg, file=sys.stderr)
+
+
+def die(msg, code=1):
+    log("ERR " + msg)
+    if JSON_OUT:
+        print(json.dumps({"ok": False, "error": msg}))
+    sys.exit(code)
+
+
+def run(cmd, check=True, quiet=True, **kw):
+    r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"{cmd[0]} failed ({r.returncode}): {(r.stderr or r.stdout).strip()[:400]}")
+    return r
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def tool(name):
+    """Locate node + the @electron/asar and @electron/fuses CLIs."""
+    if name == "node":
+        for p in ("/usr/local/bin/node", "/opt/homebrew/bin/node", shutil.which("node") or ""):
+            if p and os.path.exists(p):
+                return p
+        die("node not found (needed for asar/fuses)")
+    rel = {"asar": "@electron/asar/bin/asar.mjs", "fuses": "@electron/fuses/dist/bin.js"}[name]
+    for root in (os.path.join(HERE, "node_modules"), os.path.join(BM, "node_modules")):
+        p = os.path.join(root, rel)
+        if os.path.exists(p):
+            return p
+    die(f"{rel} missing: run `npm install` in {HERE}")
+
+
+def magick():
+    for p in ("/usr/local/bin/magick", "/opt/homebrew/bin/magick", shutil.which("magick") or ""):
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def plist_get(app, key):
+    try:
+        with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
+            return plistlib.load(f).get(key)
+    except OSError:
+        return None
+
+
+def version_of(app):
+    return plist_get(app, "CFBundleShortVersionString")
+
+
+def vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "0"))
+
+
+def slugify(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+
+
+def norm_color(c):
+    c = c.strip()
+    if not re.fullmatch(r"#?[0-9a-fA-F]{6}", c):
+        die(f"color must be #RRGGBB (got {c!r})")
+    return "#" + c.lstrip("#").upper()
+
+
+_PS = {"at": 0.0, "rows": []}
+
+
+def processes():
+    """Every process command line (ps sees ancestors; pgrep does not)."""
+    if time.time() - _PS["at"] < 1.5:
+        return _PS["rows"]
+    r = run(["/bin/ps", "-axww", "-o", "pid=,command="], check=False)
+    out = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line:
+            pid, _, cmd = line.partition(" ")
+            out.append((int(pid), cmd))
+    _PS.update(at=time.time(), rows=out)
+    return out
+
+
+# ----------------------------------------------------------------- registry --
+def load_registry():
+    reg = read_json(REGISTRY, None)
+    if reg is None:
+        reg = {"instances": adopt_existing()}
+        save_registry(reg)
+    return reg
+
+
+def save_registry(reg):
+    write_json(REGISTRY, reg)
+    # Side files other tools read without parsing JSON.
+    insts = reg["instances"]
+    with open(os.path.join(MC_DIR, "bundles.txt"), "w") as f:
+        f.write("".join(i["bundle"] + "\n" for i in insts))
+    with open(os.path.join(MC_DIR, "bundle-ids.txt"), "w") as f:
+        f.write("".join(i["bundle_id"] + "\n" for i in insts))
+    sync_theme_conf(insts)
+    sync_blackmode_agent(insts)
+
+
+def sync_blackmode_agent(insts):
+    """Point blackmode's re-apply LaunchAgent at every instance's Resources dir."""
+    pl = os.path.join(HOME, "Library", "LaunchAgents", "local.claude-blackmode.plist")
+    if not os.path.exists(pl):
+        return
+    with open(pl, "rb") as f:
+        d = plistlib.load(f)
+    want = [os.path.join(i["bundle"], "Contents", "Resources") for i in insts]
+    if d.get("WatchPaths") == want:
+        return
+    d["WatchPaths"] = want
+    with open(pl, "wb") as f:
+        plistlib.dump(d, f)
+    dom = f"gui/{os.getuid()}"
+    run(["/bin/launchctl", "bootout", dom + "/local.claude-blackmode"], check=False)
+    run(["/bin/launchctl", "bootstrap", dom, pl], check=False)
+    log("blackmode agent now watches " + ", ".join(i["name"] for i in insts))
+
+
+def theme_conf_colors():
+    out = {}
+    try:
+        for line in open(THEME_CONF):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            parts = [p.strip() for p in line.strip().split("|")]
+            if len(parts) >= 2 and parts[0]:
+                out[parts[0]] = (parts[1], parts[2] if len(parts) > 2 and parts[2] else DEFAULT_GLYPH)
+    except OSError:
+        pass
+    return out
+
+
+def sync_theme_conf(insts):
+    """Keep blackmode's theme.conf in step so apply-blackmode.sh agrees with us."""
+    if not os.path.exists(THEME_CONF):
+        return
+    lines = open(THEME_CONF).read().splitlines()
+    head = [l for l in lines if not l.strip() or l.lstrip().startswith("#")]
+    while head and not head[-1].strip():
+        head.pop()
+    body = [f"{os.path.basename(i['bundle'])[:-4]}|{i['color']}|{i['glyph']}" for i in insts]
+    with open(THEME_CONF, "w") as f:
+        f.write("\n".join(head + [""] + body) + "\n")
+
+
+def adopt_existing():
+    """First run: register every split bundle already in ~/Applications."""
+    colors = theme_conf_colors()
+    insts = []
+    for fn in sorted(os.listdir(APPS)) if os.path.isdir(APPS) else []:
+        if not (fn.startswith("Claude ") and fn.endswith(".app")) or fn.startswith("."):
+            continue
+        app = os.path.join(APPS, fn)
+        bid = plist_get(app, "CFBundleIdentifier") or ""
+        if not bid.startswith(BASE_ID + "."):
+            continue
+        name = fn[len("Claude "):-4]
+        prof = profile_from_wrapper(app) or f"Claude-{name.replace(' ', '-')}"
+        color, glyph = colors.get(fn[:-4], ("#000000", DEFAULT_GLYPH))
+        insts.append({"name": name, "bundle": app, "bundle_id": bid, "profile": prof,
+                      "color": color.upper(), "glyph": glyph.upper(),
+                      "tint": color.upper() != "#000000"})
+    return insts
+
+
+def profile_from_wrapper(app):
+    try:
+        txt = open(os.path.join(app, "Contents", "MacOS", "Claude")).read(4096)
+    except (OSError, UnicodeDecodeError):
+        return None
+    m = re.search(r'--user-data-dir="?\$HOME/Library/Application Support/([^"/]+)"?', txt)
+    return m.group(1) if m else None
+
+
+def find(reg, name):
+    key = name.strip().lower()
+    for i in reg["instances"]:
+        if i["name"].lower() == key or slugify(i["name"]) == slugify(key):
+            return i
+    die(f"no instance named {name!r} (have: {', '.join(i['name'] for i in reg['instances'])})")
+
+
+def is_running(inst):
+    needle = inst["bundle"] + "/Contents/MacOS/"
+    return any(needle in cmd for _, cmd in processes())
+
+
+def profile_busy(profile_dir):
+    """Any process (main app, Code CLI, VM helpers) living in this profile dir."""
+    needle = os.path.join(SUPPORT, profile_dir) + "/"
+    me = os.getpid()
+    return any(needle in cmd + "/" for pid, cmd in processes() if pid != me)
+
+
+def mode_of(inst):
+    """1p (claude.ai account) or 3p (gateway/Bedrock/Vertex) for this profile."""
+    d3 = os.path.join(SUPPORT, inst["profile"] + "-3p")
+    cfg = read_json(os.path.join(d3, "claude_desktop_config.json"), {})
+    meta = read_json(os.path.join(d3, "configLibrary", "_meta.json"), {})
+    if cfg.get("deploymentMode") == "1p":
+        return "1p"
+    if meta.get("appliedId"):
+        applied = meta["appliedId"]
+        entry = next((e for e in meta.get("entries", []) if e.get("id") == applied), {})
+        body = read_json(os.path.join(d3, "configLibrary", applied + ".json"), {})
+        if body:
+            return "3p:" + (entry.get("name") or "custom")
+    return "1p"
+
+
+def active_profile_dir(inst):
+    m = mode_of(inst)
+    return inst["profile"] + ("-3p" if m.startswith("3p") else "")
+
+
+# ------------------------------------------------------------- bundle build --
+def write_wrapper(macos, profile):
+    w = os.path.join(macos, "Claude")
+    with open(w, "w") as f:
+        f.write("#!/bin/bash\n"
+                "# multiclaude wrapper: pins this bundle to its own profile dir.\n"
+                'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+                f'exec "$DIR/Claude-original" --user-data-dir="$HOME/Library/Application Support/{profile}" "$@"\n')
+    os.chmod(w, 0o755)
+
+
+def inject_hook(app):
+    """Append the blackmode hook to the asar main entry (idempotent)."""
+    if not os.path.exists(HOOK):
+        return False
+    node, asar = tool("node"), tool("asar")
+    res = os.path.join(app, "Contents", "Resources")
+    tmp = tempfile.mkdtemp(prefix="mc-asar-")
+    try:
+        run([node, asar, "extract", os.path.join(res, "app.asar"), os.path.join(tmp, "x")])
+        main = json.load(open(os.path.join(tmp, "x", "package.json"))).get("main", "")
+        mp = os.path.join(tmp, "x", main)
+        if not main or not os.path.isfile(mp):
+            raise RuntimeError(f"asar main entry {main!r} missing")
+        src = open(mp, encoding="utf-8", errors="surrogateescape").read()
+        src = re.sub(r"\n?/\* === CLAUDE-BLACKMODE-HOOK.*?/\* === END CLAUDE-BLACKMODE-HOOK === \*/\n?",
+                     "", src, flags=re.S)
+        hook = open(HOOK).read()
+        with open(mp, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(src + ("\n" if not src.endswith("\n") else "") + hook)
+        new = os.path.join(tmp, "app.asar.new")
+        run([node, asar, "pack", os.path.join(tmp, "x"), new, "--unpack", UNPACK_GLOB])
+        shutil.copyfile(new, os.path.join(res, "app.asar"))
+        shutil.rmtree(os.path.join(res, "app.asar.unpacked"), ignore_errors=True)
+        if os.path.isdir(new + ".unpacked"):
+            shutil.copytree(new + ".unpacked", os.path.join(res, "app.asar.unpacked"), symlinks=True)
+        m = re.search(r"CLAUDE-BLACKMODE-HOOK v\d+", hook)
+        with open(os.path.join(res, "app.asar"), "rb") as f:
+            if m and m.group(0).encode() not in f.read():
+                raise RuntimeError("hook marker missing after pack")
+        return True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def make_icon(app, color, glyph):
+    """Recolor the stock icon art (same recipe as apply-blackmode.sh)."""
+    mg = magick()
+    src = os.path.join(STOCK_APP, "Contents", "Resources", "electron.icns")
+    if not os.path.exists(src):
+        src = os.path.join(CACHE, "stock-electron.icns")
+    rend = renderer()
+    if not os.path.exists(src) or not (mg or rend):
+        log("WARN no stock icon art or no renderer (MultiClaude.app / ImageMagick); icon left as-is")
+        return False
+    t = tempfile.mkdtemp(prefix="mc-icon-")
+    try:
+        if rend and not mg:
+            # Same recolor recipe, done in CoreGraphics by the MultiClaude binary,
+            # so a stock Mac needs no ImageMagick.
+            run([rend, "--render-icon", src, color, glyph, f"{t}/icon.png"])
+            return finish_icon(app, color, glyph, t)
+        run(["/usr/bin/sips", "-s", "format", "png", src, "--out", f"{t}/src.png"])
+        run([mg, f"{t}/src.png", "-resize", "1024x1024", f"{t}/base.png"])
+        run([mg, f"{t}/base.png", "-alpha", "extract", f"{t}/shape.png"])
+        run([mg, f"{t}/base.png", "-alpha", "off", "-channel", "RGB", "-separate",
+             "-evaluate-sequence", "min", "-level", "38%,96%", f"{t}/matte.png"])
+        run([mg, "-size", "1024x1024", f"xc:{color}",
+             "(", "-size", "1024x1024", f"xc:{glyph}", f"{t}/matte.png", "-alpha", "off",
+             "-compose", "CopyOpacity", "-composite", ")",
+             "-compose", "Over", "-composite",
+             f"{t}/shape.png", "-alpha", "off", "-compose", "CopyOpacity", "-composite", f"{t}/icon.png"])
+        return finish_icon(app, color, glyph, t)
+    finally:
+        shutil.rmtree(t, ignore_errors=True)
+
+
+def renderer():
+    for p in (os.path.join(HERE, "..", "MacOS", "MultiClaude"),
+              os.path.join(APPS, "MultiClaude.app", "Contents", "MacOS", "MultiClaude"),
+              "/Applications/MultiClaude.app/Contents/MacOS/MultiClaude"):
+        if os.access(p, os.X_OK):
+            return os.path.realpath(p)
+    return None
+
+
+def finish_icon(app, color, glyph, t):
+    """icon.png in dir t -> bundle .icns, icon cache, blackmode state."""
+    try:
+        iset = f"{t}/out.iconset"
+        os.makedirs(iset)
+        for s in (16, 32, 128, 256, 512):
+            run(["/usr/bin/sips", "-z", str(s), str(s), f"{t}/icon.png", "--out", f"{iset}/icon_{s}x{s}.png"])
+            run(["/usr/bin/sips", "-z", str(2 * s), str(2 * s), f"{t}/icon.png", "--out", f"{iset}/icon_{s}x{s}@2x.png"])
+        run(["/usr/bin/iconutil", "-c", "icns", iset, "-o", f"{t}/electron.icns"])
+        dst = os.path.join(app, "Contents", "Resources", "electron.icns")
+        shutil.copyfile(f"{t}/electron.icns", dst)
+        os.makedirs(os.path.join(MC_DIR, "icons"), exist_ok=True)
+        shutil.copyfile(f"{t}/icon.png", os.path.join(MC_DIR, "icons", slugify(os.path.basename(app)[:-4]) + ".png"))
+        run([PB, "-c", "Delete :CFBundleIconName", os.path.join(app, "Contents", "Info.plist")], check=False)
+        # Tell apply-blackmode.sh this icon is already current (its state format).
+        if os.path.isdir(BM):
+            os.makedirs(BM_STATE, exist_ok=True)
+            h = hashlib.sha256(open(dst, "rb").read()).hexdigest()
+            slug = os.path.basename(app)[:-4].replace(" ", "-")
+            with open(os.path.join(BM_STATE, slug + ".icon"), "w") as f:
+                f.write(f"{ICON_RECIPE} {color} {glyph} {h}\n")
+        return True
+    finally:
+        shutil.rmtree(t, ignore_errors=True)
+
+
+def sign(app):
+    """Same recipe as stage-*-2x.sh: inner binaries, helper, outer, deep re-seal."""
+    ent_main = os.path.join(HERE, "entitlements.plist")
+    macos = os.path.join(app, "Contents", "MacOS")
+    run(["/usr/bin/xattr", "-cr", app], check=False)
+    run(["/usr/bin/codesign", "--force", "--sign", "-", "--entitlements", ent_main,
+         os.path.join(macos, "Claude-original")])
+    helper = os.path.join(app, "Contents", "Frameworks", "Claude Helper.app")
+    if os.path.isdir(helper):
+        run(["/usr/bin/codesign", "--force", "--sign", "-", helper])
+    # Deep re-seal is mandatory on 2.x+: the fuse flip edits Electron Framework.
+    run(["/usr/bin/codesign", "--force", "--deep", "--sign", "-", "--entitlements", ent_main, app])
+    run(["/usr/bin/codesign", "--verify", app])
+
+
+def build_bundle(inst, src, dest):
+    """Build a complete themed bundle for `inst` at `dest` from `src`.
+
+    `src` is either a pristine Claude.app (from the update feed) or another
+    instance's bundle (clone). Both paths converge: wrapper, hook, fuse, id,
+    icon, signature are all (re)applied, so the result never depends on what
+    the source carried.
+    """
+    log(f"build {inst['name']}: {src} -> {dest} (v{version_of(src)})")
+    shutil.rmtree(dest, ignore_errors=True)
+    run(["/usr/bin/ditto", src, dest])
+    macos = os.path.join(dest, "Contents", "MacOS")
+    orig = os.path.join(macos, "Claude-original")
+    if not os.path.exists(orig):  # pristine: real Electron binary is MacOS/Claude
+        os.rename(os.path.join(macos, "Claude"), orig)
+    if inject_hook(dest):
+        log("  hook injected")
+        # A modified asar fails Electron's integrity check, so the fuse must go
+        # off. It lives in the real binary: flip it after the rename, before
+        # signing. Without the theme hook the asar is untouched and the fuse
+        # stays on, so stock installs need no node toolchain at all.
+        run([tool("node"), tool("fuses"), "write", "--app", dest,
+             "EnableEmbeddedAsarIntegrityValidation=off"], check=False)
+    plist = os.path.join(dest, "Contents", "Info.plist")
+    run([PB, "-c", "Set :CFBundleIdentifier " + inst["bundle_id"], plist])
+    run([PB, "-c", "Set :CFBundleName Claude", plist])
+    if run([PB, "-c", "Set :CFBundleDisplayName Claude", plist], check=False).returncode:
+        run([PB, "-c", "Add :CFBundleDisplayName string Claude", plist], check=False)
+    write_wrapper(macos, inst["profile"])
+    make_icon(dest, inst["color"], inst["glyph"])
+    sign(dest)
+    log(f"  built OK v{version_of(dest)}")
+
+
+def staged_path(inst):
+    return os.path.join(APPS, "." + os.path.basename(inst["bundle"])[:-4] + ".staged.app")
+
+
+def backup_path(inst):
+    return os.path.join(APPS, "." + os.path.basename(inst["bundle"])[:-4] + ".prev-bak.app")
+
+
+def swap_in(inst, relaunch):
+    live, stage, bak = inst["bundle"], staged_path(inst), backup_path(inst)
+    want = version_of(stage)
+    if not want:
+        raise RuntimeError(f"no staged bundle at {stage}")
+    shutil.rmtree(bak, ignore_errors=True)
+    if os.path.exists(live):
+        os.rename(live, bak)
+    try:
+        os.rename(stage, live)
+    except OSError:
+        if os.path.exists(bak):
+            os.rename(bak, live)
+        raise
+    if version_of(live) != want:
+        shutil.rmtree(live, ignore_errors=True)
+        os.rename(bak, live)
+        raise RuntimeError(f"post-swap version mismatch for {inst['name']}; rolled back")
+    run([LSREGISTER, "-f", live], check=False)
+    log(f"swapped {inst['name']} -> v{want} (rollback copy: {bak})")
+    if relaunch:
+        launch(inst)
+
+
+def launch(inst):
+    run(["/usr/bin/open", inst["bundle"]], check=False)
+
+
+# ------------------------------------------------------------------ UI tint --
+def gen_tint_css(inst):
+    """Per-instance UI tint: custom.css with its grays pulled toward the color.
+
+    The blackmode hook prefers ~/.config/Claude/custom-<bundle slug>.css and falls
+    back to custom.css, so a pure-black instance simply has no file.
+    """
+    base = os.path.join(CLAUDE_CFG, "custom.css")
+    out = os.path.join(CLAUDE_CFG, "custom-" + slugify(os.path.basename(inst["bundle"])[:-4]) + ".css")
+    if not os.path.exists(base):
+        return None
+    if not inst.get("tint", True) or inst["color"] == "#000000":
+        if os.path.exists(out) and "multiclaude" in open(out).read(300):
+            os.remove(out)
+        return None
+    if os.path.exists(out) and "multiclaude" not in open(out).read(300):
+        # Hand-written file (e.g. the original custom-claude-work.css): only
+        # replace it when the instance color actually changed from the conf.
+        if not inst.get("tint_regen"):
+            return out
+    r, g, b = (int(inst["color"][i:i + 2], 16) / 255 for i in (1, 3, 5))
+    h, _, _ = colorsys.rgb_to_hls(r, g, b)
+    H = round(h * 360)
+
+    def dark(l):  # near-black gray -> very dark tinted surface
+        return 4 + l * 0.55 if l < 12 else l
+
+    def sat(l):
+        return 45 if l < 12 else 14
+
+    def hsl_trip(m):
+        l = float(m.group(1))
+        return f"{H} {sat(l)}% {dark(l):.0f}%"
+
+    def hex_gray(m):
+        v = m.group(1)
+        if len(v) == 3:
+            v = "".join(c * 2 for c in v)
+        rr, gg, bb = (int(v[i:i + 2], 16) for i in (0, 2, 4))
+        if not (rr == gg == bb):
+            return m.group(0)
+        l = rr / 255 * 100
+        nl, ns = dark(l) / 100, (sat(l) if l < 12 else 8) / 100
+        cr, cg, cb = colorsys.hls_to_rgb(H / 360, nl, ns)
+        return "#%02x%02x%02x" % (round(cr * 255), round(cg * 255), round(cb * 255))
+
+    css = open(base).read()
+    css = re.sub(r"\b0 0% (\d+(?:\.\d+)?)%", hsl_trip, css)
+    css = re.sub(r"#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b(?![0-9a-fA-F])", hex_gray, css)
+    hdr = (f"/* multiclaude: Claude {inst['name']} tint (hue {H}, from {inst['color']}).\n"
+           f"   Generated from custom.css; edits are overwritten on recolor. Cmd+R to reload. */\n")
+    with open(out, "w") as f:
+        f.write(hdr + css)
+    return out
+
+
+# ------------------------------------------------------------ pending queue --
+def op_label(op):
+    k, n, a, b = op["op"], op.get("name", ""), op.get("src", ""), op.get("dst", "")
+    return {"swap": f"Finish upgrading Claude {n}",
+            "rebuild": f"Apply new icon to Claude {n}",
+            "move-3p": f"Move {a}'s Bedrock/gateway setup to {b}",
+            "copy-mcp": f"Copy MCP servers {a} → {b}",
+            "copy-routines": f"{'Move' if op.get('move') else 'Copy'} routines {a} → {b}"}.get(k, f"{k} {n}")
+
+
+def queue(op):
+    q = read_json(PENDING, [])
+    op.setdefault("id", uuid.uuid4().hex[:8])
+    op.setdefault("queued_at", dt.datetime.now().isoformat(timespec="seconds"))
+    # Collapse duplicates: a newer swap/rebuild of the same instance replaces the
+    # older one, and an identical copy/move request is not queued twice.
+    same = lambda x: x["op"] == op["op"] and x.get("name") == op.get("name")
+    key = lambda x: (x.get("src"), x.get("dst"), x.get("servers"), x.get("ids"), x.get("move"))
+    if any(same(x) and key(x) == key(op) and op["op"] not in ("swap", "rebuild") for x in q):
+        log(f"already queued: {op['op']} {op.get('name', '')}")
+        return
+    q = [x for x in q if not (same(x) and op["op"] in ("swap", "rebuild"))]
+    op.setdefault("label", op_label(op))
+    q.append(op)
+    write_json(PENDING, q)
+    log(f"queued {op['op']} {op.get('name', '')} (waits for: {', '.join(op.get('wait', [])) or 'nothing'})")
+    ensure_runner()
+
+
+def ensure_runner():
+    pid = read_json(RUNNER_PID, {}).get("pid")
+    if pid:
+        try:
+            os.kill(pid, 0)
+            return
+        except OSError:
+            pass
+    subprocess.Popen([sys.executable, os.path.realpath(__file__), "_runner"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=open(LOG, "a"), start_new_session=True)
+
+
+def notify(msg):
+    run(["/usr/bin/osascript", "-e",
+         f'display notification {json.dumps(msg)} with title "MultiClaude"'], check=False)
+
+
+def op_ready(reg, op):
+    for n in op.get("wait", []):
+        inst = next((i for i in reg["instances"] if i["name"] == n), None)
+        if inst and is_running(inst):
+            return False
+    # Profile stragglers (background Code sessions, crashpad) can outlive a quit
+    # indefinitely, so this wait is soft: give them 90s after the apps are gone.
+    busy = [p for p in op.get("wait_profiles", []) if profile_busy(p)]
+    if busy:
+        first = _APPS_CLOSED_AT.setdefault(op["id"], time.time())
+        if time.time() - first < 90:
+            return False
+        log(f"runner: {', '.join(busy)} still has stragglers after 90s; proceeding")
+    return True
+
+
+_APPS_CLOSED_AT = {}
+
+
+def exec_op(reg, op):
+    kind = op["op"]
+    if kind == "swap":
+        swap_in(find(reg, op["name"]), op.get("relaunch", True))
+    elif kind == "rebuild":
+        inst = find(reg, op["name"])
+        build_bundle(inst, inst["bundle"], staged_path(inst))
+        swap_in(inst, op.get("relaunch", False))
+    elif kind == "move-3p":
+        do_move_3p(reg, op)
+    elif kind == "copy-mcp":
+        do_copy_mcp(reg, op["src"], op["dst"], op.get("servers"))
+    elif kind == "copy-routines":
+        do_copy_routines(reg, op["src"], op["dst"], op.get("ids"), op.get("move", False))
+    else:
+        raise RuntimeError(f"unknown op {kind}")
+    for n in op.get("launch_after", []):
+        inst = find(reg, n)
+        if hook_stale(inst) and not is_running(inst):
+            # The app is closed right now anyway: bring its hook current before
+            # relaunching (apply-blackmode.sh only gets a chance on its 6h tick).
+            try:
+                build_bundle(inst, inst["bundle"], staged_path(inst))
+                swap_in(inst, relaunch=False)
+            except Exception as e:
+                log(f"hook refresh for {n} failed (launching as-is): {e}")
+        launch(inst)
+
+
+def hook_stale(inst):
+    if not os.path.exists(HOOK):
+        return False
+    m = re.search(r"CLAUDE-BLACKMODE-HOOK v\d+", open(HOOK).read())
+    try:
+        with open(os.path.join(inst["bundle"], "Contents", "Resources", "app.asar"), "rb") as f:
+            return bool(m) and m.group(0).encode() not in f.read()
+    except OSError:
+        return False
+
+
+def cmd_runner(_a):
+    write_json(RUNNER_PID, {"pid": os.getpid(), "started": time.time()})
+    try:
+        while True:
+            q = read_json(PENDING, [])
+            if not q:
+                break
+            reg = load_registry()
+            progressed = False
+            for op in list(q):
+                if not op_ready(reg, op):
+                    continue
+                log(f"runner: executing {op['op']} {op.get('name', '')} [{op['id']}]")
+                try:
+                    exec_op(reg, op)
+                    notify(op.get("done_msg") or f"{op['op']} {op.get('name', '')} done")
+                    set_status(f"done: {op['op']} {op.get('name', '')}")
+                except Exception as e:  # keep the queue moving; record the failure
+                    log(f"runner: {op['op']} failed: {e}")
+                    notify(f"{op['op']} {op.get('name', '')} FAILED: {e}"[:200])
+                    set_status(f"failed: {op['op']} {op.get('name', '')}: {e}")
+                cur = read_json(PENDING, [])
+                write_json(PENDING, [x for x in cur if x["id"] != op["id"]])
+                progressed = True
+                break  # re-read registry/queue after every op
+            if not progressed:
+                time.sleep(4)
+    finally:
+        try:
+            os.remove(RUNNER_PID)
+        except OSError:
+            pass
+
+
+def set_status(msg):
+    write_json(STATUS, {"at": time.time(), "msg": msg})
+
+
+# ------------------------------------------------------------ MCP + routines --
+MCP_FILES = ["Claude Extensions", "Claude Extensions Settings", "extensions-installations.json",
+             "mcp-user-tool-toggles.json"]
+
+
+def desktop_cfg_path(inst):
+    return os.path.join(SUPPORT, active_profile_dir(inst), "claude_desktop_config.json")
+
+
+def list_mcp(inst):
+    d = os.path.join(SUPPORT, active_profile_dir(inst))
+    servers = list((read_json(desktop_cfg_path(inst), {}).get("mcpServers") or {}).keys())
+    exts = []
+    ed = os.path.join(d, "Claude Extensions")
+    if os.path.isdir(ed):
+        exts = sorted(x for x in os.listdir(ed) if not x.startswith("."))
+    return {"servers": servers, "extensions": exts}
+
+
+def do_copy_mcp(reg, src_name, dst_name, only=None):
+    src, dst = find(reg, src_name), find(reg, dst_name)
+    sd, dd = (os.path.join(SUPPORT, active_profile_dir(i)) for i in (src, dst))
+    os.makedirs(dd, exist_ok=True)
+    scfg = read_json(desktop_cfg_path(src), {})
+    dpath = desktop_cfg_path(dst)
+    dcfg = read_json(dpath, {})
+    if os.path.exists(dpath):
+        shutil.copyfile(dpath, dpath + ".bak-multiclaude-" + time.strftime("%Y%m%d%H%M%S"))
+    servers = scfg.get("mcpServers") or {}
+    if only:
+        servers = {k: v for k, v in servers.items() if k in only}
+    merged = dict(dcfg.get("mcpServers") or {})
+    merged.update(servers)
+    dcfg["mcpServers"] = merged
+    write_json(dpath, dcfg, mode=0o600)
+    copied = list(servers)
+    if not only:  # extensions (DXT) come along on a full copy
+        for n in MCP_FILES:
+            s, d = os.path.join(sd, n), os.path.join(dd, n)
+            if os.path.isdir(s):
+                shutil.copytree(s, d, symlinks=True, dirs_exist_ok=True)
+                copied.append(n + "/")
+            elif os.path.isfile(s) and not os.path.exists(d):
+                shutil.copyfile(s, d)
+                copied.append(n)
+    log(f"copy-mcp {src['name']} -> {dst['name']}: {', '.join(copied) or 'nothing to copy'}")
+
+
+def routine_files(inst):
+    """scheduled-tasks.json files for this instance, newest first.
+
+    Desktop keeps routines per account+org at
+    <profile>/claude-code-sessions/<account>/<org>/scheduled-tasks.json; the
+    prompt bodies (SKILL.md) live in the shared ~/.claude/scheduled-tasks.
+    """
+    root = os.path.join(SUPPORT, active_profile_dir(inst), "claude-code-sessions")
+    out = []
+    if os.path.isdir(root):
+        for acct in os.listdir(root):
+            for org in (os.listdir(os.path.join(root, acct)) if os.path.isdir(os.path.join(root, acct)) else []):
+                p = os.path.join(root, acct, org, "scheduled-tasks.json")
+                if os.path.isfile(p):
+                    out.append(p)
+    return sorted(out, key=os.path.getmtime, reverse=True)
+
+
+def list_routines(inst):
+    rows = []
+    for p in routine_files(inst):
+        for t in read_json(p, {}).get("scheduledTasks", []):
+            rows.append({"id": t.get("id"), "name": t.get("displayName") or t.get("id"),
+                         "cron": t.get("cronExpression"), "enabled": t.get("enabled", True),
+                         "cwd": t.get("cwd"), "file": p})
+    return rows
+
+
+def do_copy_routines(reg, src_name, dst_name, ids=None, move=False):
+    src, dst = find(reg, src_name), find(reg, dst_name)
+    sfiles, dfiles = routine_files(src), routine_files(dst)
+    if not dfiles:
+        raise RuntimeError(f"{dst['name']} has no routines store yet: sign in there and open the Code tab once")
+    tasks = [t for p in sfiles for t in read_json(p, {}).get("scheduledTasks", [])]
+    if ids:
+        tasks = [t for t in tasks if t.get("id") in ids]
+    dpath = dfiles[0]
+    data = read_json(dpath, {"scheduledTasks": []})
+    have = {t.get("id") for t in data.get("scheduledTasks", [])}
+    shutil.copyfile(dpath, dpath + ".bak-multiclaude-" + time.strftime("%Y%m%d%H%M%S"))
+    added = []
+    for t in tasks:
+        if t.get("id") in have:
+            continue
+        nt = {k: v for k, v in t.items() if k not in ("lastRunAt", "lastScheduledFor", "notifySessionId")}
+        nt["createdAt"] = int(time.time() * 1000)
+        data.setdefault("scheduledTasks", []).append(nt)
+        added.append(t.get("id"))
+    write_json(dpath, data, mode=0o600)
+    if move and added:  # disable (never delete) at the source so it can't double-fire
+        for p in sfiles:
+            sd = read_json(p, {})
+            changed = False
+            for t in sd.get("scheduledTasks", []):
+                if t.get("id") in added and t.get("enabled", True):
+                    t["enabled"] = False
+                    changed = True
+            if changed:
+                shutil.copyfile(p, p + ".bak-multiclaude-" + time.strftime("%Y%m%d%H%M%S"))
+                write_json(p, sd, mode=0o600)
+    log(f"copy-routines {src['name']} -> {dst['name']}: added {added or 'none'}"
+        f"{' (disabled at source)' if move and added else ''}")
+
+
+def do_move_3p(reg, op):
+    """Hand a profile's 3p (gateway/Bedrock) config to another instance.
+
+    The app keeps 3p state in <profile>-3p and runs in 3p mode whenever a
+    config is applied there, which is what made Claude Work lose its claude.ai
+    account. Moving the whole dir gives the 3p setup (incl. its Code sessions)
+    to the target, and the source is pinned to 1p.
+    """
+    src, dst = find(reg, op["src"]), find(reg, op["dst"])
+    s3 = os.path.join(SUPPORT, src["profile"] + "-3p")
+    d3 = os.path.join(SUPPORT, dst["profile"] + "-3p")
+    if mode_of(dst).startswith("3p"):
+        # The target already got its own gateway config (e.g. set up by hand);
+        # moving would shove it aside, so leave both as they are.
+        log(f"move-3p skipped: {dst['name']} is already {mode_of(dst)}")
+        return
+    if not os.path.isdir(s3):
+        raise RuntimeError(f"{s3} does not exist")
+    if os.path.exists(d3):
+        os.rename(d3, d3 + ".pre-move-" + time.strftime("%Y%m%d%H%M%S"))
+    os.makedirs(os.path.join(SUPPORT, dst["profile"]), exist_ok=True)
+    os.rename(s3, d3)
+    os.makedirs(s3, mode=0o700)
+    write_json(os.path.join(s3, "claude_desktop_config.json"), {"deploymentMode": "1p"}, mode=0o600)
+    log(f"move-3p: {s3} -> {d3}; {src['name']} pinned to 1p")
+
+
+# ----------------------------------------------------------------- commands --
+def inst_view(i):
+    app = i["bundle"]
+    return {**i, "version": version_of(app), "exists": os.path.isdir(app),
+            "running": is_running(i), "mode": mode_of(i),
+            "staged": version_of(staged_path(i)),
+            "icon_png": os.path.join(MC_DIR, "icons", slugify(os.path.basename(app)[:-4]) + ".png")}
+
+
+def cmd_list(a):
+    reg = load_registry()
+    if read_json(PENDING, []):
+        ensure_runner()  # survives reboots / a killed runner: the menu polls list
+    rows = [inst_view(i) for i in reg["instances"]]
+    if JSON_OUT:
+        print(json.dumps({"ok": True, "instances": rows, "pending": read_json(PENDING, []),
+                          "status": read_json(STATUS, {}), "latest": read_json(os.path.join(MC_DIR, "latest.json"), {})}))
+        return
+    for r in rows:
+        print(f"{'●' if r['running'] else '○'} {r['name']:<12} v{r['version'] or '?':<12} {r['mode']:<10} "
+              f"{r['color']}  {r['profile']}{'  staged v' + r['staged'] if r['staged'] else ''}")
+    for p in read_json(PENDING, []):
+        print(f"  pending: {p['op']} {p.get('name', p.get('src', ''))} (waits for {', '.join(p.get('wait', []) + p.get('wait_profiles', []))})")
+
+
+def cmd_create(a):
+    reg = load_registry()
+    os.makedirs(APPS, exist_ok=True)
+    name = a.name.strip()
+    if name.lower().startswith("claude "):
+        name = name[7:]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _-]{0,30}", name):
+        die("name: letters, digits, space, - or _ (max 31)")
+    if any(slugify(i["name"]) == slugify(name) for i in reg["instances"]):
+        die(f"instance {name!r} already exists")
+    slug = slugify(name)
+    inst = {"name": name, "bundle": os.path.join(APPS, f"Claude {name}.app"),
+            "bundle_id": f"{BASE_ID}.{slug}", "profile": f"Claude-{name.replace(' ', '-')}",
+            "color": norm_color(a.color), "glyph": norm_color(a.glyph or DEFAULT_GLYPH),
+            "tint": not a.no_tint}
+    if os.path.exists(inst["bundle"]):
+        die(f"{inst['bundle']} already exists")
+    src = pick_source(reg, a.source)
+    build_bundle(inst, src, inst["bundle"])
+    run([LSREGISTER, "-f", inst["bundle"]], check=False)
+    reg["instances"].append(inst)
+    save_registry(reg)
+    gen_tint_css(inst)
+    log(f"created Claude {name} ({inst['bundle_id']}, profile {inst['profile']})")
+    if a.copy_mcp_from:
+        do_copy_mcp(reg, a.copy_mcp_from, name)
+    if a.launch:
+        launch(inst)
+    out({"ok": True, "instance": inst_view(inst)})
+
+
+def pick_source(reg, source):
+    """Newest pristine base if cached, else clone the newest existing instance."""
+    if source:
+        for i in reg["instances"]:
+            if i["name"].lower() == source.lower():
+                return i["bundle"]
+        if os.path.isdir(source):
+            return source
+        die(f"source {source!r} is neither an instance nor an app path")
+    bases = []
+    bdir = os.path.join(CACHE, "base")
+    for v in os.listdir(bdir) if os.path.isdir(bdir) else []:
+        app = os.path.join(bdir, v, "Claude.app")
+        if version_of(app):
+            bases.append((vtuple(version_of(app)), app))
+    # The stock /Applications/Claude.app is a pristine base too (copied, never modified).
+    if version_of(STOCK_APP) and plist_get(STOCK_APP, "CFBundleIdentifier") == BASE_ID:
+        bases.append((vtuple(version_of(STOCK_APP)), STOCK_APP))
+    clones = [(vtuple(version_of(i["bundle"])), i["bundle"]) for i in reg["instances"] if version_of(i["bundle"])]
+    best = sorted(bases + clones, key=lambda x: x[0])
+    if not best:
+        die("no Claude.app found: install Claude in /Applications, or run `multiclaude upgrade` to download it")
+    top = best[-1][0]
+    # Prefer a pristine base over a clone at the same version.
+    for v, app in bases:
+        if v == top:
+            return app
+    return best[-1][1]
+
+
+def cmd_recolor(a):
+    reg = load_registry()
+    inst = find(reg, a.name)
+    inst["color"] = norm_color(a.color)
+    if a.glyph:
+        inst["glyph"] = norm_color(a.glyph)
+    if a.tint is not None:
+        inst["tint"] = a.tint == "on"
+    inst["tint_regen"] = True
+    save_registry(reg)
+    gen_tint_css(inst)  # live: Cmd+R in the app picks it up
+    if is_running(inst):
+        queue({"op": "rebuild", "name": inst["name"], "wait": [inst["name"]], "relaunch": True,
+               "done_msg": f"Claude {inst['name']} icon recolored"})
+        out({"ok": True, "deferred": True, "msg": "UI tint applied now (Cmd+R); icon updates when the app quits"})
+    else:
+        build_bundle(inst, inst["bundle"], staged_path(inst))
+        swap_in(inst, relaunch=False)
+        out({"ok": True, "deferred": False})
+
+
+def cmd_remove(a):
+    reg = load_registry()
+    inst = find(reg, a.name)
+    if is_running(inst):
+        die(f"quit Claude {inst['name']} first")
+    trash = os.path.join(HOME, ".Trash", os.path.basename(inst["bundle"])[:-4] + time.strftime(" %Y%m%d-%H%M%S") + ".app")
+    if os.path.exists(inst["bundle"]):
+        os.rename(inst["bundle"], trash)
+    reg["instances"] = [i for i in reg["instances"] if i is not inst]
+    save_registry(reg)
+    log(f"removed Claude {inst['name']} (bundle in Trash; profile {inst['profile']} kept)")
+    out({"ok": True, "trash": trash, "profile_kept": os.path.join(SUPPORT, inst["profile"])})
+
+
+def cmd_launch(a):
+    launch(find(load_registry(), a.name))
+    out({"ok": True})
+
+
+def cmd_quit(a):
+    inst = find(load_registry(), a.name)
+    # AppleScript quit by bundle id = the app's normal quit path (saves state).
+    run(["/usr/bin/osascript", "-e", f'tell application id "{inst["bundle_id"]}" to quit'], check=False)
+    out({"ok": True})
+
+
+def feed_latest(cur):
+    did = str(uuid.uuid4())
+    osv = run(["/usr/bin/sw_vers", "-productVersion"]).stdout.strip()
+    url = f"{FEED}?device_id={did}&version={cur}&os_version={osv}"
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "multiclaude"}), timeout=30) as r:
+        if r.status == 204:
+            return None
+        d = json.load(r)
+    rel = next((x for x in d.get("releases", []) if x.get("version") == d.get("currentRelease")), None)
+    return (rel or {}).get("updateTo")
+
+
+def cmd_upgrade(a):
+    reg = load_registry()
+    vers = [version_of(i["bundle"]) for i in reg["instances"] if version_of(i["bundle"])]
+    cur = min(vers, key=vtuple) if vers else "0.0.0"
+    upd = feed_latest(cur)
+    latest = {"checked": time.time(), "version": upd and upd["version"], "installed_min": cur,
+              "size": upd and upd.get("size")}
+    write_json(os.path.join(MC_DIR, "latest.json"), latest)
+    if a.check:
+        out({"ok": True, **latest})
+        return
+    if not upd:
+        die("feed returned no update")
+    ver = upd["version"]
+    base = os.path.join(CACHE, "base", ver, "Claude.app")
+    if not version_of(base):
+        set_status(f"downloading Claude {ver}…")
+        os.makedirs(os.path.join(CACHE, "zips"), exist_ok=True)
+        z = os.path.join(CACHE, "zips", f"Claude-{ver}.zip")
+        if not os.path.exists(z) or hashlib.sha256(open(z, "rb").read()).hexdigest() != upd["sha256"]:
+            log(f"downloading {upd['url']}")
+            run(["/usr/bin/curl", "-fsSL", "-o", z + ".part", upd["url"]])
+            os.replace(z + ".part", z)
+        h = hashlib.sha256(open(z, "rb").read()).hexdigest()
+        if h != upd["sha256"]:
+            die(f"sha256 mismatch for {z}: {h}")
+        tmpd = os.path.join(CACHE, "base", ver + ".tmp")
+        shutil.rmtree(tmpd, ignore_errors=True)
+        run(["/usr/bin/ditto", "-x", "-k", z, tmpd])
+        shutil.rmtree(os.path.dirname(base), ignore_errors=True)
+        os.rename(tmpd, os.path.dirname(base))
+        # Keep the stock icon art around even if /Applications/Claude.app goes away.
+        shutil.copyfile(os.path.join(base, "Contents", "Resources", "electron.icns"),
+                        os.path.join(CACHE, "stock-electron.icns"))
+    targets = [find(reg, n) for n in a.names] if a.names else reg["instances"]
+    report = []
+    for inst in targets:
+        if vtuple(version_of(inst["bundle"])) >= vtuple(ver) and not a.force:
+            report.append({"name": inst["name"], "result": "current"})
+            continue
+        set_status(f"staging Claude {inst['name']} {ver}…")
+        build_bundle(inst, base, staged_path(inst))
+        if is_running(inst):
+            queue({"op": "swap", "name": inst["name"], "wait": [inst["name"]], "relaunch": True,
+                   "done_msg": f"Claude {inst['name']} upgraded to {ver}"})
+            report.append({"name": inst["name"], "result": "staged; swaps in when it quits"})
+        else:
+            swap_in(inst, relaunch=False)
+            report.append({"name": inst["name"], "result": "upgraded"})
+    set_status(f"upgrade to {ver}: " + ", ".join(f"{r['name']} {r['result']}" for r in report))
+    out({"ok": True, "version": ver, "report": report})
+
+
+def cmd_finish(a):
+    """Quit an instance now so its pending swap/rebuild runs (it relaunches)."""
+    inst = find(load_registry(), a.name)
+    run(["/usr/bin/osascript", "-e", f'tell application id "{inst["bundle_id"]}" to quit'], check=False)
+    ensure_runner()
+    out({"ok": True})
+
+
+def cmd_copy_mcp(a):
+    reg = load_registry()
+    dst = find(reg, a.dst)
+    find(reg, a.src)
+    if is_running(dst):
+        queue({"op": "copy-mcp", "name": dst["name"], "src": a.src, "dst": a.dst, "servers": a.servers,
+               "wait": [dst["name"]], "launch_after": [dst["name"]],
+               "done_msg": f"MCP config copied into Claude {dst['name']}"})
+        out({"ok": True, "deferred": True, "msg": f"runs when Claude {dst['name']} quits, then relaunches it"})
+    else:
+        do_copy_mcp(reg, a.src, a.dst, a.servers)
+        out({"ok": True, "deferred": False})
+
+
+def cmd_copy_routines(a):
+    reg = load_registry()
+    src, dst = find(reg, a.src), find(reg, a.dst)
+    wait = [dst["name"]] + ([src["name"]] if a.move else [])
+    if any(is_running(i) for i in (dst, src) if i["name"] in wait):
+        queue({"op": "copy-routines", "name": dst["name"], "src": a.src, "dst": a.dst, "ids": a.ids,
+               "move": a.move, "wait": wait, "launch_after": wait,
+               "done_msg": f"Routines copied into Claude {dst['name']}"})
+        out({"ok": True, "deferred": True, "msg": f"runs when {' and '.join('Claude ' + w for w in wait)} quit"})
+    else:
+        do_copy_routines(reg, a.src, a.dst, a.ids, a.move)
+        out({"ok": True, "deferred": False})
+
+
+def cmd_move_3p(a):
+    reg = load_registry()
+    src, dst = find(reg, a.src), find(reg, a.dst)
+    queue({"op": "move-3p", "name": dst["name"], "src": src["name"], "dst": dst["name"],
+           "wait": [src["name"], dst["name"]], "wait_profiles": [src["profile"] + "-3p"],
+           "launch_after": [src["name"], dst["name"]] if a.launch else [],
+           "done_msg": f"3p config moved {src['name']} -> {dst['name']}; both relaunched"})
+    out({"ok": True, "deferred": True})
+
+
+def cmd_info(a):
+    inst = find(load_registry(), a.name)
+    out({"ok": True, "instance": inst_view(inst), "mcp": list_mcp(inst), "routines": list_routines(inst)})
+
+
+def cmd_pending(a):
+    if a.cancel:
+        q = [x for x in read_json(PENDING, []) if x["id"] != a.cancel]
+        write_json(PENDING, q)
+    out({"ok": True, "pending": read_json(PENDING, [])})
+
+
+def out(obj):
+    if JSON_OUT:
+        print(json.dumps(obj))
+    else:
+        for k, v in obj.items():
+            if k != "ok":
+                print(f"{k}: {json.dumps(v) if isinstance(v, (dict, list)) else v}")
+
+
+JSON_OUT = False
+
+
+def main():
+    global JSON_OUT
+    p = argparse.ArgumentParser(prog="multiclaude", description=__doc__.split("\n\n")[0])
+    p.add_argument("--json", action="store_true", help="machine-readable output (menubar app)")
+    sp = p.add_subparsers(dest="cmd")
+    sp.add_parser("list", help="instances, versions, running state, mode, pending ops")
+    c = sp.add_parser("create", help="build a new instance")
+    c.add_argument("name")
+    c.add_argument("--color", required=True, help="icon background #RRGGBB (also tints the UI)")
+    c.add_argument("--glyph", help="starburst color (default stock #FEFCFB)")
+    c.add_argument("--no-tint", action="store_true", help="keep the UI pure black")
+    c.add_argument("--source", help="instance name or Claude.app path to build from")
+    c.add_argument("--copy-mcp-from", help="copy MCP servers/extensions from this instance")
+    c.add_argument("--launch", action="store_true")
+    r = sp.add_parser("recolor", help="change an instance's colors")
+    r.add_argument("name"); r.add_argument("--color", required=True); r.add_argument("--glyph")
+    r.add_argument("--tint", choices=["on", "off"])
+    for n in ("remove", "launch", "quit", "info", "finish"):
+        x = sp.add_parser(n); x.add_argument("name")
+    u = sp.add_parser("upgrade", help="download latest Claude and upgrade instances (swaps on quit)")
+    u.add_argument("names", nargs="*"); u.add_argument("--check", action="store_true")
+    u.add_argument("--force", action="store_true")
+    m = sp.add_parser("copy-mcp", help="copy desktop MCP servers + extensions between instances")
+    m.add_argument("src"); m.add_argument("dst"); m.add_argument("--servers", nargs="*")
+    rt = sp.add_parser("copy-routines", help="copy scheduled routines between instances")
+    rt.add_argument("src"); rt.add_argument("dst"); rt.add_argument("--ids", nargs="*")
+    rt.add_argument("--move", action="store_true", help="disable them at the source afterwards")
+    mv = sp.add_parser("move-3p", help="give SRC's 3p (Bedrock/gateway) setup to DST; SRC back to 1p")
+    mv.add_argument("src"); mv.add_argument("dst"); mv.add_argument("--launch", action="store_true")
+    pe = sp.add_parser("pending"); pe.add_argument("--cancel")
+    sp.add_parser("_runner")
+    sp.add_parser("sync", help="rewrite side files (theme.conf, blackmode agent, bundle lists)")
+    a = p.parse_args()
+    JSON_OUT = a.json
+    os.makedirs(MC_DIR, exist_ok=True)
+    fn = {"list": cmd_list, "create": cmd_create, "recolor": cmd_recolor, "remove": cmd_remove,
+          "launch": cmd_launch, "quit": cmd_quit, "info": cmd_info, "upgrade": cmd_upgrade,
+          "finish": cmd_finish, "copy-mcp": cmd_copy_mcp, "copy-routines": cmd_copy_routines,
+          "move-3p": cmd_move_3p, "pending": cmd_pending, "_runner": cmd_runner,
+          "sync": lambda a: (save_registry(load_registry()), out({"ok": True}))}.get(a.cmd)
+    if not fn:
+        p.print_help()
+        return
+    try:
+        fn(a)
+    except RuntimeError as e:
+        die(str(e))
+
+
+if __name__ == "__main__":
+    main()
