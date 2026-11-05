@@ -8,6 +8,9 @@ A menubar icon lets you create copies, pick their colors, upgrade all of them to
 the latest Claude, copy MCP servers and routines between them, and cycle through
 every Claude window with ⌘\`.
 
+**On Windows**, the same thing lives in the notification area: see
+[WINDOWS.md](WINDOWS.md) (install with `windows\install.cmd`).
+
 > Unofficial. MultiClaude makes copies of Claude.app with a different bundle id
 > and re-signs them ad hoc. Your normal `/Applications/Claude.app` is never
 > modified. The copies can't update themselves; use **Upgrade All** in the

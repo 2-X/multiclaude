@@ -1,0 +1,49 @@
+MultiClaude for Windows, version 1.0.0
+======================================
+
+Run several copies of the Claude desktop app at the same time, each with its
+own sign-in, chats, settings and icon color (for example Personal and Work).
+Your regular Claude app is not changed.
+
+You need: Windows 10 or 11, and the Claude app installed (Microsoft Store or
+claude.com/download).
+
+INSTALL
+
+1. Right-click the zip > Extract All, and open the extracted folder.
+2. Double-click "Install MultiClaude".
+   - If Windows says "Windows protected your PC": click More info, then Run
+     anyway. (MultiClaude isn't signed by a publisher.)
+3. A Settings page opens. Find CLAUDE in the list and set it to MultiClaude.
+   This makes "Continue with Google" sign-in come back to the right copy.
+4. MultiClaude now sits in the notification area at the bottom right (click
+   the ^ arrow if you don't see it). It starts by itself when you sign in.
+
+MAKE A COPY
+
+Click the MultiClaude icon > New Instance... Give it a name (Work, Personal,
+a client's name), pick a color, click Create. "Claude <name>" opens; sign in
+with the account that copy is for. Each copy gets its own Start menu entry and
+taskbar button, so you can pin it.
+
+Copies start empty: sign in fresh in each one. Your regular Claude keeps its
+own chats and sign-in.
+
+GOOD TO KNOW
+
+- Closing a copy's window only hides it to its tray icon. To really quit it,
+  use Quit in the MultiClaude menu or in the copy's own tray icon.
+- Copies don't update themselves. MultiClaude rebuilds them when your
+  regular Claude updates, and Upgrade All in its menu fetches the newest
+  Claude for all of them. A copy that's open switches over when you quit it.
+- Alt+` (the key left of 1) switches between all your Claude windows while one
+  of them is in front.
+- Remove Instance... puts a copy's app in the Recycle Bin and keeps its chats
+  and settings.
+
+UNINSTALL
+
+Double-click "Uninstall MultiClaude" in this folder. Your copies and their chats
+are kept; remove the copies from the menu first if you want them gone.
+
+More: https://github.com/2-X/multiclaude/blob/windows-v1.0.0/WINDOWS.md
